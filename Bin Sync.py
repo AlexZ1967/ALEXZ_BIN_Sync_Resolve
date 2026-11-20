@@ -10,6 +10,7 @@ import sys
 import tempfile
 import traceback
 import uuid
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -49,17 +50,46 @@ def state_directory():
     return base / "alexz-resolve-bin-sync"
 
 
-def lock_project(file):
-    """Acquire a non-blocking lock until the file handle closes."""
+@contextmanager
+def lock_project(path):
+    """Hold a non-blocking, process-scoped lock for the project session."""
     if WINDOWS:
-        import msvcrt
+        import ctypes
+        from ctypes import wintypes
 
-        file.seek(0)
-        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_file = kernel.CreateFileW
+        open_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                              wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        open_file.restype = wintypes.HANDLE
+        close_handle = kernel.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        generic_read_write = 0xC0000000
+        open_always = 4
+        file_attribute_normal = 0x80
+        handle = open_file(str(path), generic_read_write, 0, None,
+                           open_always, file_attribute_normal, None)
+        if handle == ctypes.c_void_p(-1).value:
+            error = ctypes.get_last_error()
+            if error == 32:  # ERROR_SHARING_VIOLATION
+                raise RuntimeError("Файл блокировки занят. Закрой другое окно Bin Sync для этого проекта.")
+            raise RuntimeError(f"Windows не открыла файл блокировки {path}. "
+                               f"Код {error}: {ctypes.FormatError(error).strip()}")
+        try:
+            yield
+        finally:
+            close_handle(handle)
     else:
         import fcntl
 
-        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with path.open("a+b") as file:
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("Окно Bin Sync для этого проекта уже открыто.") from exc
+            yield
 
 
 def media(name):
@@ -571,14 +601,9 @@ class Session:
         base.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.base = base
         self.project_key = hashlib.sha256(self.pool_id.encode()).hexdigest()
-        self.lock = (base / (self.project_key + ".lock")).open("a+b")
+        self.lock = ExitStack()
         try:
-            lock_project(self.lock)
-        except OSError as exc:
-            self.lock.close()
-            raise RuntimeError(f"Не удалось заблокировать состояние Bin Sync. "
-                               f"Проверь, открыто ли уже его окно. {exc}") from exc
-        try:
+            self.lock.enter_context(lock_project(base / (self.project_key + ".lock")))
             self.bindings = {}
             prefix = self.project_key
             for file in sorted(base.glob(prefix + "*.json")):
