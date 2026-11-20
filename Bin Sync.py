@@ -1,7 +1,6 @@
 """Synchronize a disk directory with a dedicated Resolve Media Pool bin."""
 
 import ctypes
-import fcntl
 import hashlib
 import json
 import os
@@ -11,13 +10,19 @@ import stat
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 EXTENSIONS = set("mov mp4 mxf mkv avi m4v mts m2ts webm braw r3d wav aif aiff mp3 flac m4a png jpg jpeg tif tiff exr dpx".split())
 STILLS = set("png jpg jpeg tif tiff exr dpx".split())
 RECOVERY = ".resolve-bin-sync-recovery"
 ROOT = ""
+WINDOWS = os.name == "nt"
 
 
 def require(condition, message):
@@ -29,7 +34,33 @@ def component(name):
     require(name not in ("", ".", "..") and "/" not in name and
             not any(ord(ch) < 32 for ch in name) and not name.startswith("."),
             f"Имя не подходит для синхронизации: {name!r}")
+    if WINDOWS:
+        is_reserved = getattr(os.path, "isreserved", None)
+        if is_reserved:
+            reserved = is_reserved(name)
+        else:
+            reserved = (name.endswith((" ", ".")) or any(ch in name for ch in '\\:*?"<>|')
+                        or PureWindowsPath(name).is_reserved())
+        require(not reserved, f"Windows не допускает имя {name!r}.")
     return name
+
+
+def state_directory():
+    """Return per-user state storage for the current platform."""
+    if WINDOWS:
+        base = Path(os.environ["LOCALAPPDATA"])
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    return base / "alexz-resolve-bin-sync"
+
+
+def lock_project(file):
+    """Acquire a non-blocking lock until the file handle closes."""
+    if WINDOWS:
+        file.seek(0)
+        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def media(name):
@@ -37,6 +68,7 @@ def media(name):
 
 
 def identity(info):
+    require(not WINDOWS or info.st_ino != 0, "Файловая система не сообщила стабильный ID объекта.")
     return f"{info.st_dev}:{info.st_ino}"
 
 
@@ -48,7 +80,7 @@ def sequence_path(path):
     """Recognize Resolve paths that represent a range of numbered images."""
     if not is_still(path):
         return False
-    stem = PurePosixPath(path).stem
+    stem = Path(path).stem
     return bool(re.search(r"\[\d+\s*-\s*\d+\]|%0?\d*d|#{2,}", stem))
 
 
@@ -64,9 +96,27 @@ def under(path, folder):
     return path.startswith(folder + "/")
 
 
+def filesystem_key(path):
+    """Compare Windows path components case-insensitively on disk."""
+    return path.lower() if WINDOWS else path
+
+
+def source_matches(source, expected):
+    """Compare native clip paths while keeping the media filename's spelling."""
+    actual = Path(source)
+    return actual.parent == expected.parent and actual.name == expected.name
+
+
+def is_link(info):
+    """Recognize symlinks and Windows directory junctions."""
+    return stat.S_ISLNK(info.st_mode) or (
+        WINDOWS and getattr(info, "st_reparse_tag", 0) == stat.IO_REPARSE_TAG_MOUNT_POINT
+    )
+
+
 def stat_regular(path):
     info = path.lstat()
-    require(stat.S_ISREG(info.st_mode) and path.resolve(strict=True) == path,
+    require(stat.S_ISREG(info.st_mode) and not is_link(info) and path.resolve(strict=True) == path,
             f"Ожидался обычный файл без символических ссылок: {path}")
     return info
 
@@ -83,8 +133,9 @@ class Entry:
 def disk_tree(root, root_id):
     """Read a complete snapshot of managed paths on one mounted filesystem."""
     result = {}
+    disk_names = set()
     root_info = root.lstat()
-    require(stat.S_ISDIR(root_info.st_mode) and root.resolve(strict=True) == root and
+    require(stat.S_ISDIR(root_info.st_mode) and not is_link(root_info) and root.resolve(strict=True) == root and
             identity(root_info) == root_id, "Привязанная папка недоступна или была заменена.")
 
     def scan(folder, prefix):
@@ -92,13 +143,16 @@ def disk_tree(root, root_id):
             if path.name.startswith("."):
                 continue
             info = path.lstat()
-            if stat.S_ISLNK(info.st_mode):
+            if is_link(info):
                 continue
             is_dir = stat.S_ISDIR(info.st_mode)
             if not is_dir and not (stat.S_ISREG(info.st_mode) and media(path.name)):
                 continue
             require(info.st_dev == root_info.st_dev, f"Вложенная точка монтирования: {path}")
             rel = join(prefix, component(path.name))
+            key = filesystem_key(rel)
+            require(key not in disk_names, f"На диске есть пути, различающиеся только регистром: {rel}.")
+            disk_names.add(key)
             result[rel] = Entry("bin" if is_dir else "clip", identity(info),
                                 stamp=() if is_dir else (info.st_size, info.st_mtime_ns))
             if is_dir:
@@ -191,10 +245,10 @@ def make_plan(previous, disk, bins, folders, clips, root):
             right[key] = path
             used_bins.add(path)
             if kind == "clip":
-                expected = {str(root / key)}
+                expected = [root / key]
                 if key in left:
-                    expected.add(str(root / left[key]))
-                require(bins[path].source in expected, f"Клип вручную перелинкован: {path}.")
+                    expected.append(root / left[key])
+                require(any(source_matches(bins[path].source, p) for p in expected), f"Клип вручную перелинкован: {path}.")
         else:
             require(bin_id not in folders and bin_id not in clips,
                     f"Объект перемещён за пределы привязки или перестал быть обычным медиа: {key}.")
@@ -204,7 +258,7 @@ def make_plan(previous, disk, bins, folders, clips, root):
         left[key] = path
         if path in bins and path not in used_bins:
             require(disk[path].kind == bins[path].kind and
-                    (disk[path].kind == "bin" or bins[path].source == str(root / path)),
+                    (disk[path].kind == "bin" or source_matches(bins[path].source, root / path)),
                     f"Диск и Media Pool содержат разные объекты по пути {path}.")
             right[key] = path
             used_bins.add(path)
@@ -252,8 +306,9 @@ def make_plan(previous, disk, bins, folders, clips, root):
                     f"Перемещение образует цикл или оставляет объект в удаляемой папке: {left.get(key) or right.get(key)}.")
             parent, name = desired[key]
             path = join(target(parent, trail | {key}) if parent is not None else ROOT, name)
-            require(path not in occupied, f"Два объекта претендуют на {path}.")
-            occupied.add(path)
+            disk_key = filesystem_key(path)
+            require(disk_key not in occupied, f"Два объекта претендуют на {path}.")
+            occupied.add(disk_key)
             targets[key] = path
         return targets[key]
 
@@ -268,6 +323,11 @@ def schedule(current, targets, kinds, side):
     paths = dict(current)
     ops = []
     settled = {ROOT}
+
+    def path_key(path):
+        return filesystem_key(path) if side == "Диск" else path
+
+    occupied = {path_key(path): key for key, path in paths.items()}
     for kind in ("bin", "clip"):
         pending = [key for key in targets if kinds[key] == kind]
         while pending:
@@ -278,14 +338,19 @@ def schedule(current, targets, kinds, side):
                 if parent_of(dest) not in settled:
                     continue
                 if dest != old:
-                    if dest in paths.values():
+                    owner = occupied.get(path_key(dest))
+                    if owner is not None and owner != key:
                         continue
                     if old is not None and kind == "bin" and under(dest, old):
                         continue
                     ops.append((side, "add" if old is None else "move", key, old, dest))
+                    if old is not None:
+                        del occupied[path_key(old)]
                     if old is not None and kind == "bin":
                         paths = {k: dest + p[len(old):] if under(p, old) else p for k, p in paths.items()}
+                        occupied = {path_key(path): k for k, path in paths.items() if k != key}
                     paths[key] = dest
+                    occupied[path_key(dest)] = key
                 settled.add(dest)
                 pending.remove(key)
                 progressed = True
@@ -297,7 +362,25 @@ def schedule(current, targets, kinds, side):
 
 
 def move_noreplace(source, destination):
-    """Rename on Linux without ever replacing the destination."""
+    """Rename within a volume without replacing an existing destination."""
+    if WINDOWS:
+        # Windows os.rename защищает существующее имя назначения.
+        if source == destination and source.name != destination.name and destination.exists():
+            require(source.samefile(destination), f"Занято имя назначения: {destination}.")
+            temp = source.with_name(f".bin-sync-rename-{uuid.uuid4().hex}")
+            os.rename(source, temp)
+            try:
+                os.rename(temp, destination)
+            except OSError:
+                try:
+                    os.rename(temp, source)
+                except OSError as rollback:
+                    raise RuntimeError(f"Не удалось восстановить имя {source}. Файл или папка остались в {temp}.") from rollback
+                raise
+        else:
+            os.rename(source, destination)
+        return
+
     libc = ctypes.CDLL(None, use_errno=True)
     rename = libc.renameat2
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
@@ -313,7 +396,12 @@ def copy_noreplace(source, destination):
     fd, temporary = tempfile.mkstemp(prefix=".bin-sync-", dir=destination.parent)
     os.close(fd)
     try:
-        shutil.copy2(source, temporary)
+        if WINDOWS:
+            # Не переносим атрибут «только чтение» на временный файл.
+            shutil.copyfile(source, temporary)
+            os.utime(temporary, ns=(before.st_atime_ns, before.st_mtime_ns))
+        else:
+            shutil.copy2(source, temporary)
         after = stat_regular(source)
         require((identity(before), before.st_size, before.st_mtime_ns) ==
                 (identity(after), after.st_size, after.st_mtime_ns),
@@ -325,14 +413,14 @@ def copy_noreplace(source, destination):
 
 def retarget(pool, item, destination):
     """Relink the existing Media Pool item and verify its new source."""
-    old = Path(item.GetClipProperty("File Path"))
-    if old == destination:
+    old = Path(item.GetClipProperty("File Path") or "")
+    if source_matches(str(old), destination):
         return
     if old.name == destination.name:
         ok = pool.RelinkClips([item], str(destination.parent))
     else:
         ok = item.ReplaceClipPreserveSubClip(str(destination))
-    require(ok and item.GetClipProperty("File Path") == str(destination),
+    require(ok and source_matches(item.GetClipProperty("File Path") or "", destination),
             f"Resolve не перелинковал клип на {destination}.")
 
 
@@ -357,7 +445,7 @@ def import_file(pool, storage, folder, source):
         return {item.GetUniqueId(): item for item in result}
 
     before = items()
-    require(not any(item.GetClipProperty("File Path") == path for item in before.values()),
+    require(not any(source_matches(item.GetClipProperty("File Path") or "", source) for item in before.values()),
             f"В целевом bin уже есть клип для {path}.")
     diagnostics = []
     plain = ("ImportMedia(пути)", lambda: pool.ImportMedia([path]))
@@ -381,7 +469,7 @@ def import_file(pool, storage, folder, source):
         added = [item for uid, item in after.items() if uid not in before]
         if len(added) == 1 and before.keys() <= after.keys():
             actual = added[0].GetClipProperty("File Path") or ""
-            if actual == path:
+            if source_matches(actual, source):
                 return added[0], ""
             # Если Resolve сгруппировал кадры, убираем только элемент, возвращённый этим вызовом.
             if (is_still(path) and sequence_path(actual) and Path(actual).parent == source.parent
@@ -422,13 +510,13 @@ def preflight(root, project, previous, disk, bins, clips, plan):
         require(not (resolve_deletes & timeline_references(project)),
                 "Один из удаляемых клипов используется на таймлайне. Сначала разберись с ним в Resolve.")
     managed = {entry.id for entry in bins.values() if entry.kind == "clip"}
-    external_references = {str(Path(source).resolve()) for uid, (_, source, _) in clips.items()
+    external_references = {Path(source).resolve() for uid, (_, source, _) in clips.items()
                            if uid not in managed and source and Path(source).is_absolute()}
 
     for key, path in left.items():
         dest = targets.get(key)
         if kinds[key] == "clip" and dest != path:
-            require(str(root / path) not in external_references,
+            require(root / path not in external_references,
                     f"На {path} ссылается клип вне привязки или неподдерживаемый клип.")
         if key in deleting and kinds[key] == "clip":
             old = previous[key]
@@ -449,8 +537,9 @@ def preflight(root, project, previous, disk, bins, clips, plan):
             stat_regular(source)
             if root in source.parents:
                 relative = source.relative_to(root).as_posix()
-                existing = next((other for other, origin in left.items() if origin == relative), None)
-                require(existing is not None and targets.get(existing) == relative,
+                existing = next((other for other, origin in left.items()
+                                 if filesystem_key(origin) == filesystem_key(relative)), None)
+                require(existing is not None and targets.get(existing) == left[existing],
                         f"Исходник копии одновременно перемещается или удаляется: {relative}.")
 
 
@@ -477,14 +566,13 @@ class Session:
         self.pool = project.GetMediaPool()
         self.pool_id = self.pool.GetUniqueId()
         require(self.pool_id, "Resolve не сообщил ID Media Pool.")
-        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
-        base = base / "alexz-resolve-bin-sync"
+        base = state_directory()
         base.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.base = base
         self.project_key = hashlib.sha256(self.pool_id.encode()).hexdigest()
-        self.lock = (base / (self.project_key + ".lock")).open("a")
+        self.lock = (base / (self.project_key + ".lock")).open("a+b")
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_project(self.lock)
         except OSError:
             self.lock.close()
             raise RuntimeError("Окно Bin Sync для этого проекта уже открыто.") from None
@@ -649,7 +737,7 @@ class Session:
                 text = f"{verb} {noun} {source}"
             messages.append(f"{side}: {text}")
         relinks = [key for key in right if key in targets and kinds[key] == "clip" and
-                   bins[right[key]].source != str(root / targets[key])]
+                   not source_matches(bins[right[key]].source, root / targets[key])]
         for key in relinks:
             messages.append(f"Bin: перелинковать {right[key]} на {targets[key]}")
         self.preview = (root, root_id, linked_id, disk, bins, plan, ops, relinks, interrupted)
@@ -710,7 +798,7 @@ class Session:
                     if source:
                         info = source.lstat()
                         expected = disk[left[key]]
-                        require(source.resolve(strict=True) == source and identity(info) == expected.id and
+                        require(not is_link(info) and source.resolve(strict=True) == source and identity(info) == expected.id and
                                 (is_bin or (info.st_size, info.st_mtime_ns) == expected.stamp),
                                 f"Объект на диске изменился во время синхронизации: {source}.")
                     if dest:
@@ -791,7 +879,7 @@ class Session:
                     continue
                 file, entry = final_disk[dest], final_bins[dest]
                 require(file.kind == entry.kind == kinds[key] and
-                        (entry.kind == "bin" or entry.source == str(root / dest)),
+                        (entry.kind == "bin" or source_matches(entry.source, root / dest)),
                         f"После применения не совпадает источник или тип {dest}.")
                 require(entry.id == handles[key].GetUniqueId(), f"Resolve изменил ID {dest}.")
                 entries[dest] = {"kind": file.kind, "disk": file.id, "bin": entry.id, "stamp": list(file.stamp)}
