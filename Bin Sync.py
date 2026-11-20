@@ -1,22 +1,17 @@
 """Synchronize a disk directory with a dedicated Resolve Media Pool bin."""
 
-import ctypes
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
-
 
 EXTENSIONS = set("mov mp4 mxf mkv avi m4v mts m2ts webm braw r3d wav aif aiff mp3 flac m4a png jpg jpeg tif tiff exr dpx".split())
 STILLS = set("png jpg jpeg tif tiff exr dpx".split())
@@ -48,7 +43,7 @@ def component(name):
 def state_directory():
     """Return per-user state storage for the current platform."""
     if WINDOWS:
-        base = Path(os.environ["LOCALAPPDATA"])
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
     else:
         base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
     return base / "alexz-resolve-bin-sync"
@@ -57,9 +52,13 @@ def state_directory():
 def lock_project(file):
     """Acquire a non-blocking lock until the file handle closes."""
     if WINDOWS:
+        import msvcrt
+
         file.seek(0)
         msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
     else:
+        import fcntl
+
         fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
@@ -381,6 +380,8 @@ def move_noreplace(source, destination):
             os.rename(source, destination)
         return
 
+    import ctypes
+
     libc = ctypes.CDLL(None, use_errno=True)
     rename = libc.renameat2
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
@@ -573,9 +574,10 @@ class Session:
         self.lock = (base / (self.project_key + ".lock")).open("a+b")
         try:
             lock_project(self.lock)
-        except OSError:
+        except OSError as exc:
             self.lock.close()
-            raise RuntimeError("Окно Bin Sync для этого проекта уже открыто.") from None
+            raise RuntimeError(f"Не удалось заблокировать состояние Bin Sync. "
+                               f"Проверь, открыто ли уже его окно. {exc}") from exc
         try:
             self.bindings = {}
             prefix = self.project_key
@@ -910,21 +912,45 @@ class Session:
         return message
 
 
+def startup_log(message, *, reset=False):
+    """Record startup progress even when Resolve never displays the window."""
+    try:
+        directory = state_directory()
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (directory / "startup.log").open("w" if reset else "a", encoding="utf-8") as file:
+            file.write(message + "\n")
+    except OSError as error:
+        print(f"[Bin Sync] Не удалось записать журнал запуска: {error}")
+
+
+def resolve_context():
+    """Use the menu script context, with the official SDK module as fallback."""
+    bridge = globals().get("bmd")
+    app = globals().get("resolve")
+    if not bridge:
+        import DaVinciResolveScript as bridge
+    if not app:
+        app = bridge.scriptapp("Resolve")
+    require(app, "Resolve Scripting API недоступен.")
+    fusion_app = globals().get("fusion") or app.Fusion()
+    require(fusion_app, "Resolve не предоставил Fusion UI.")
+    return bridge, app, fusion_app
+
+
 def main():
     """Open the Resolve Studio UI from Workspace > Scripts."""
-    bridge = globals().get("bmd")
-    if not bridge:
-        import fusionscript as bridge
-    app = globals().get("resolve") or bridge.scriptapp("Resolve")
-    require(app, "Resolve Scripting API недоступен.")
+    bridge, app, fusion = resolve_context()
+    startup_log("Получен контекст Resolve.")
     manager = app.GetProjectManager()
     project = manager.GetCurrentProject()
     require(project, "Открой проект Resolve.")
-    fusion = app.Fusion()
     ui = fusion.UIManager
     require(ui, "Для окна Bin Sync нужен UIManager Resolve Studio.")
     dispatcher = bridge.UIDispatcher(ui)
+    require(dispatcher, "Resolve не создал UI Dispatcher для Bin Sync.")
+    startup_log("Получен UIManager.")
     session = Session(manager, project, app.GetMediaStorage())
+    startup_log("Прочитано состояние проекта.")
     try:
         window = dispatcher.AddWindow(
             {"ID": "BinSync", "WindowTitle": "Bin Sync — " + project.GetName(),
@@ -1089,6 +1115,7 @@ def main():
         window.On.Exit.Clicked = lambda event: dispatcher.ExitLoop()
         window.On.BinSync.Close = lambda event: dispatcher.ExitLoop()
         window.Show()
+        startup_log("Окно Bin Sync открыто.")
         try:
             dispatcher.RunLoop()
         finally:
@@ -1098,7 +1125,10 @@ def main():
 
 
 if __name__ == "__main__":
+    startup_log(f"Запуск Bin Sync: {sys.platform}, Python {sys.version.split()[0]}", reset=True)
     try:
         main()
     except Exception as error:
+        startup_log(traceback.format_exc())
         print(f"[Bin Sync] {error}")
+        print(f"[Bin Sync] Журнал запуска: {state_directory() / 'startup.log'}")
